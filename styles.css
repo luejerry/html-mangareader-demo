@@ -143,6 +143,10 @@ input {
 .prev .arrow.right {
   right: 0;
 }
+.disable-nav .next,
+.disable-nav .prev {
+  display: none;
+}
 
 .prev {
   left: 0;

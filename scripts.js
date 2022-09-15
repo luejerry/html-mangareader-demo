@@ -2,6 +2,10 @@
 /**
  * GENERIC UTILITY FUNCTIONS
  */
+/**
+ * Convenience function that creates an `IntersectionObserver` that executes a callback passing it
+ * the element that is intersecting the viewport with the greatest intersection ratio.
+ */
 function onIntersectChange(targetIntersectHandler, { threshold, rootMargin }) {
     return new IntersectionObserver((entries) => {
         entries
@@ -56,6 +60,34 @@ function throttle(func, millis) {
             lastArgs = args;
         }
     };
+}
+/**
+ * Returns a debounced version of a given input function, which will be executed after `millis`
+ * milliseconds of no additional invocations. Each invocation that occurs within the timing window
+ * resets the timer.
+ * @param func Function to be debounced
+ * @param millis Debounce time in milliseconds
+ * @param initial If true, the initial invocation executes immediately before the debounce
+ * window begins. If no more invocations occur, the function is not executed again; otherwise
+ * behaves as if `initial = false`.
+ */
+function debounce(func, millis, initial = false) {
+    let count = 0;
+    const loop = async (...args) => {
+        if (!count && initial) {
+            func(...args);
+        }
+        count++;
+        const id = count;
+        await asyncTimeout(millis);
+        if (id === count) {
+            count = 0;
+            if (id > 1 || !initial) {
+                func(...args);
+            }
+        }
+    };
+    return loop;
 }
 /**
  * Basic semver comparator. Only works with numbers, e.g. 1.2.1. Returns positive if target newer
@@ -120,22 +152,20 @@ function createAnimationDispatcher() {
  * CONFIGURATION AND CONSTANTS
  */
 const versionCheckUrl = 'https://api.github.com/repos/luejerry/html-mangareader/contents/version';
+/**
+ * Key for which app data is stored in LocalStorage
+ */
 const storageKey = 'mangareader-config';
-const defaultConfig = {
-    smoothScroll: true,
-    darkMode: false,
-    seamless: false,
-};
-const SCREENCLAMP = {
-    none: 'none',
-    shrink: 'shrink',
-    fit: 'fit',
-};
-const ORIENTATION = {
-    portrait: 'portrait',
-    square: 'square',
-    landscape: 'landscape',
-};
+/**
+ * Max number of pages to load at once, if `dynamicImageLoading` is enabled in `config.ini`
+ */
+const maxLoadedImages = 20;
+/**
+ * Max number of navbar previews to load at once, if `dynamicImageLoading` is enabled in
+ * `config.ini`
+ */
+const maxLoadedPreviews = 60;
+const loadingPlaceholder = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8HwYAAloBV80ot9EAAAAASUVORK5CYII=';
 const smartFit = {
     size0: {
         portrait: {
@@ -143,7 +173,10 @@ const smartFit = {
             height: 1024,
         },
         landscape: {
-            height: 800,
+            height: 1024,
+        },
+        portraitLong: {
+            width: 720,
         },
     },
     size1: {
@@ -152,7 +185,10 @@ const smartFit = {
             height: 1440,
         },
         landscape: {
-            height: 1080,
+            height: 1280,
+        },
+        portraitLong: {
+            width: 1080,
         },
     },
 };
@@ -181,6 +217,7 @@ const INTERSECT_MARGIN = {
     const smoothScrollCheckbox = document.getElementById('input-smooth-scroll');
     const darkModeCheckbox = document.getElementById('input-dark-mode');
     const seamlessCheckbox = document.getElementById('input-seamless');
+    const scrubberIconDiv = document.getElementById('scrubber-icon');
     const scrubberContainerDiv = document.getElementById('scrubber-container');
     const scrubberDiv = document.getElementById('scrubber');
     const scrubberPreviewDiv = document.getElementById('scrubber-preview');
@@ -188,41 +225,102 @@ const INTERSECT_MARGIN = {
     const scrubberMarkerActive = document.getElementById('scrubber-marker-active');
     let scrubberImages; // Array of images, set in `setupScrubber()`
     const animationDispatcher = createAnimationDispatcher();
+    let intersectObserver;
     let visiblePage;
+    let configIni = {};
     // Used by scrubber
     const scrubberState = {
         screenHeight: 0,
         previewHeight: 0,
         markerHeight: 0,
         visiblePageIndex: 0,
+        previewPageIndex: 0,
         viewDirection: 'vertical',
     };
+    /**
+     * Read local `config.ini` file which is encoded in base64 in the `body[data-config]` attribute.
+     * @returns Parsed config object, or empty object if valid config not found.
+     */
+    function load_config_ini() {
+        try {
+            return JSON.parse(atob(document.body.dataset.config || ''));
+        }
+        catch (e) {
+            console.error('Failed to parse config.ini', e);
+            return {};
+        }
+    }
+    /**
+     * Setup tasks to be run when the user scrolls to a new page.
+     */
     function setupIntersectionObserver(threshold, rootMargin) {
+        const throttledUpdateLoadedImages = throttle(updateLoadedImages, 1000);
         const observer = onIntersectChange((target) => {
             visiblePage = target;
             if (target.dataset.index == null) {
                 return;
             }
-            scrubberState.visiblePageIndex = parseInt(target.dataset.index, 10);
             // Update the URL hash as user scrolls.
             const url = new URL(location.href);
             url.hash = target.id;
             history.replaceState(null, '', url.toString());
+            // Update the scrubber marker as user scrolls.
+            scrubberState.visiblePageIndex = parseInt(target.dataset.index, 10);
             setScrubberMarkerActive(scrubberState.visiblePageIndex);
+            if (configIni.dynamicImageLoading) {
+                throttledUpdateLoadedImages(images, scrubberState.visiblePageIndex, maxLoadedImages, 'pageloader');
+            }
         }, { threshold, rootMargin });
         for (const page of pages) {
             observer.observe(page);
         }
         return observer;
     }
-    let intersectObserver = setupIntersectionObserver(0, INTERSECT_MARGIN.vertical);
+    /**
+     * Load and unload images as the visible page changes with scrolling.
+     * @param imgs Images to load/unload.
+     * @param visiblePageIndex Index of currently visible page. Images within a distance of this page
+     * are loaded, and images outside this distance are unloaded. A null value unloads all images.
+     * @param maxLoad Maximum number of images to be loaded at once.
+     * @param tag Task identifier, to distinguish separate usages from each other in the animation
+     * scheduler.
+     */
+    function updateLoadedImages(imgs, visiblePageIndex, maxLoad, tag) {
+        animationDispatcher.addTask(tag, () => {
+            const maxDistance = maxLoad / 2;
+            for (const [i, img] of imgs.entries()) {
+                if (visiblePageIndex == null) {
+                    img.src = loadingPlaceholder;
+                }
+                else if ((!img.src || img.src === loadingPlaceholder) &&
+                    Math.max(visiblePageIndex - maxDistance, 0) <= i &&
+                    i <= visiblePageIndex + maxDistance) {
+                    img.src = img.dataset.src || loadingPlaceholder;
+                }
+                else if (img.src !== loadingPlaceholder &&
+                    (i < visiblePageIndex - maxDistance || visiblePageIndex + maxDistance < i)) {
+                    img.src = loadingPlaceholder;
+                }
+            }
+        });
+    }
     const imagesMeta = images.map((image) => {
-        const ratio = image.naturalWidth / image.naturalHeight;
+        const ratio = image.height / image.width;
         return {
             image,
-            orientation: ratio > 1 ? 'landscape' : 'portrait',
+            orientation: ratio > 2 ? 'portraitLong' : ratio > 1 ? 'portrait' : 'landscape',
         };
     });
+    /**
+     * Read the configuration stored in browser LocalStorage. Unlike `config.ini` these settings can
+     * be changed directly from the UI.
+     *
+     * Note that some browser security policies may forbid LocalStorage access, in which case this
+     * function will return an empty object.
+     *
+     * @returns Parsed configuration file, or empty object if valid config not found or cannot be
+     * accessed.
+     */
     function readConfig() {
         let config = {};
         try {
@@ -235,6 +333,11 @@ const INTERSECT_MARGIN = {
         }
         return config;
     }
+    /**
+     * Update configuration to browser LocalStorage. Note that some browser security policies may
+     * forbid LocalStorage access, in which case this function will do nothing.
+     * @param config Configuration key-value pairs to update. Update is merged with existing config.
+     */
     function writeConfig(config) {
         const oldConfig = readConfig();
         const newConfig = { ...oldConfig, ...config };
@@ -245,14 +348,34 @@ const INTERSECT_MARGIN = {
             console.error(err);
         }
     }
-    function loadSettings() {
+    /**
+     * Do initial setup of the page based on configuration settings.
+     */
+    async function loadSettings() {
+        configIni = load_config_ini();
         const config = readConfig();
+        initShowNavPref(configIni);
         initScalingMode(config);
+        // Need to wait for page to render, otherwise intersection observer fires before viewport
+        // moves to the initial URL hash for the opened image
+        await asyncTimeout(0);
         setupDirection(config);
         setupZenscroll(config);
         setupDarkMode(config);
         setupSeamless(config);
+        setupScrubber(configIni);
     }
+    /**
+     * Hide the navigation buttons if `disable-nav = yes` in `config.ini`.
+     */
+    function initShowNavPref(config) {
+        if (config.disableNavButtons) {
+            document.body.classList.add('disable-nav');
+        }
+    }
+    /**
+     * Apply the user's last selected image scaling preference. Defaults to original size.
+     */
     function initScalingMode(config) {
         const scaling = config.scaling || 'none';
         switch (scaling) {
@@ -274,6 +397,9 @@ const INTERSECT_MARGIN = {
                 return smartFitImages(smartFit.size1);
         }
     }
+    /**
+     * Apply the user's last selected layout direction preference. Defaults to vertical direction.
+     */
     async function setupDirection(config) {
         var _a;
         const direction = config.direction || 'vertical';
@@ -292,6 +418,9 @@ const INTERSECT_MARGIN = {
             (_a = pages[0]) === null || _a === void 0 ? void 0 : _a.scrollIntoView({ inline: 'end' });
         }
     }
+    /**
+     * Apply the user's last selected smooth scroll preference.
+     */
     function setupZenscroll(config) {
         window.zenscroll.setup(170);
         if (config.smoothScroll) {
@@ -301,6 +430,9 @@ const INTERSECT_MARGIN = {
             window.pauseZenscroll = true;
         }
     }
+    /**
+     * Apply the user's last selected dark mode preference.
+     */
     function setupDarkMode(config) {
         var _a;
         darkModeCheckbox.checked = (_a = config.darkMode) !== null && _a !== void 0 ? _a : false;
@@ -310,6 +442,9 @@ const INTERSECT_MARGIN = {
             darkModeCheckbox.dispatchEvent(change);
         }
     }
+    /**
+     * Apply the user's last selected collapse spacing preference.
+     */
     function setupSeamless(config) {
         var _a;
         seamlessCheckbox.checked = (_a = config.seamless) !== null && _a !== void 0 ? _a : false;
@@ -318,34 +453,58 @@ const INTERSECT_MARGIN = {
             seamlessCheckbox.dispatchEvent(change);
         }
     }
+    /**
+     * @returns Width of the browser viewport in pixels.
+     */
     function getWidth() {
         return document.documentElement.clientWidth;
     }
+    /**
+     * @returns Height of the browser viewport in pixels.
+     */
     function getHeight() {
         return document.documentElement.clientHeight;
     }
+    function getImageHeightAttribute(img) {
+        return parseInt(img.getAttribute('height') || '-1', 10);
+    }
+    function getImageWidthAttribute(img) {
+        return parseInt(img.getAttribute('width') || '-1', 10);
+    }
+    /**
+     * @returns Rescaled height of an image if sized to `width`, preserving aspect ratio.
+     */
+    function widthToRatioHeight(img, width) {
+        return (width / getImageWidthAttribute(img)) * getImageHeightAttribute(img);
+    }
+    /**
+     * @returns Rescaled width of an image if sized to `height`, preserving aspect ratio.
+     */
+    function heightToRatioWidth(img, height) {
+        return (height / getImageHeightAttribute(img)) * getImageWidthAttribute(img);
+    }
     function handleOriginalSize() {
-        setImagesWidth(SCREENCLAMP.none, getWidth());
+        setImagesWidth('none', getWidth());
         writeConfig({ scaling: 'none' });
     }
     function handleShrinkSize() {
-        setImagesDimensions(SCREENCLAMP.shrink, getWidth(), getHeight());
+        setImagesDimensions('shrink', getWidth(), getHeight());
         writeConfig({ scaling: 'shrink' });
     }
     function handleFitWidth() {
-        setImagesWidth(SCREENCLAMP.fit, getWidth());
+        setImagesWidth('fit', getWidth());
         writeConfig({ scaling: 'fit_width' });
     }
     function handleFitHeight() {
-        setImagesHeight(SCREENCLAMP.fit, getHeight());
+        setImagesHeight('fit', getHeight());
         writeConfig({ scaling: 'fit_height' });
     }
     function handleShrinkWidth() {
-        setImagesWidth(SCREENCLAMP.shrink, getWidth());
+        setImagesWidth('shrink', getWidth());
         writeConfig({ scaling: 'shrink_width' });
     }
     function handleShrinkHeight() {
-        setImagesHeight(SCREENCLAMP.shrink, getHeight());
+        setImagesHeight('shrink', getHeight());
         writeConfig({ scaling: 'shrink_height' });
     }
     function handleSmartWidth(event) {
@@ -360,28 +519,23 @@ const INTERSECT_MARGIN = {
     function setImagesWidth(fitMode, width) {
         for (const img of images) {
             switch (fitMode) {
-                case SCREENCLAMP.fit:
+                case 'fit':
                     Object.assign(img.style, {
                         width: `${width}px`,
-                        maxWidth: null,
-                        height: null,
-                        maxHeight: null,
+                        height: `${widthToRatioHeight(img, width)}px`,
                     });
                     break;
-                case SCREENCLAMP.shrink:
+                case 'shrink':
+                    const maxWidth = Math.min(getImageWidthAttribute(img), width);
                     Object.assign(img.style, {
-                        width: null,
-                        maxWidth: `${width}px`,
-                        height: null,
-                        maxHeight: null,
+                        width: `${maxWidth}px`,
+                        height: `${widthToRatioHeight(img, maxWidth)}px`,
                     });
                     break;
                 default:
                     Object.assign(img.style, {
                         width: null,
-                        maxWidth: null,
                         height: null,
-                        maxHeight: null,
                     });
             }
         }
@@ -390,28 +544,23 @@ const INTERSECT_MARGIN = {
     function setImagesHeight(fitMode, height) {
         for (const img of images) {
             switch (fitMode) {
-                case SCREENCLAMP.fit:
+                case 'fit':
                     Object.assign(img.style, {
                         height: `${height}px`,
-                        maxWidth: null,
-                        width: null,
-                        maxHeight: null,
+                        width: `${heightToRatioWidth(img, height)}px`,
                     });
                     break;
-                case SCREENCLAMP.shrink:
+                case 'shrink':
+                    const maxHeight = Math.min(getImageHeightAttribute(img), height);
                     Object.assign(img.style, {
-                        width: null,
-                        maxHeight: `${height}px`,
-                        height: null,
-                        maxWidth: null,
+                        width: `${heightToRatioWidth(img, maxHeight)}px`,
+                        height: `${maxHeight}px`,
                     });
                     break;
                 default:
                     Object.assign(img.style, {
                         width: null,
-                        maxWidth: null,
                         height: null,
-                        maxHeight: null,
                     });
             }
         }
@@ -420,47 +569,64 @@ const INTERSECT_MARGIN = {
     function setImagesDimensions(fitMode, width, height) {
         for (const img of images) {
             switch (fitMode) {
-                case SCREENCLAMP.fit:
+                case 'fit':
                     // Not implemented
                     break;
-                case SCREENCLAMP.shrink:
-                    Object.assign(img.style, {
-                        width: null,
-                        maxHeight: `${height}px`,
-                        height: null,
-                        maxWidth: `${width}px`,
-                    });
+                case 'shrink':
+                    clampImageSize(img, height, width);
                     break;
                 default:
                     Object.assign(img.style, {
                         width: null,
-                        maxWidth: null,
                         height: null,
-                        maxHeight: null,
                     });
             }
         }
         visiblePage === null || visiblePage === void 0 ? void 0 : visiblePage.scrollIntoView();
     }
+    function clampImageSize(img, height, width) {
+        const scaledWidth = heightToRatioWidth(img, height);
+        const scaledHeight = widthToRatioHeight(img, width);
+        if (getImageHeightAttribute(img) <= height && getImageWidthAttribute(img) <= width) {
+            Object.assign(img.style, {
+                width: null,
+                height: null,
+            });
+        }
+        else if (scaledWidth > width) {
+            Object.assign(img.style, {
+                width: `${width}px`,
+                height: `${scaledHeight}px`,
+            });
+        }
+        else if (scaledHeight > height) {
+            Object.assign(img.style, {
+                width: `${scaledWidth}px`,
+                height: `${height}px`,
+            });
+        }
+    }
     function smartFitImages(fitMode) {
+        const screenWidth = getWidth();
+        const screenHeight = getHeight();
         for (const { image: img, orientation: orient } of imagesMeta) {
             switch (orient) {
-                case ORIENTATION.portrait:
+                case 'portrait':
+                    const maxHeight = Math.min(getImageHeightAttribute(img), fitMode.portrait.height);
                     Object.assign(img.style, {
-                        width: null,
-                        maxWidth: null,
-                        height: null,
-                        maxHeight: `${fitMode.portrait.height}px`,
+                        width: `${heightToRatioWidth(img, maxHeight)}px`,
+                        height: `${maxHeight}px`,
                     });
                     break;
-                case ORIENTATION.landscape:
-                    Object.assign(img.style, {
-                        width: null,
-                        maxWidth: `${getWidth()}px`,
-                        height: null,
-                        maxHeight: `${fitMode.landscape.height}px`,
-                    });
+                case 'landscape':
+                    clampImageSize(img, Math.min(screenHeight, fitMode.landscape.height), screenWidth);
                     break;
+                case 'portraitLong':
+                    const maxWidth = Math.min(getImageWidthAttribute(img), fitMode.portraitLong.width);
+                    Object.assign(img.style, {
+                        width: `${maxWidth}px`,
+                        height: `${widthToRatioHeight(img, maxWidth)}px`,
+                    });
             }
         }
         visiblePage === null || visiblePage === void 0 ? void 0 : visiblePage.scrollIntoView({ inline: 'center' });
@@ -468,7 +634,7 @@ const INTERSECT_MARGIN = {
     function setDirection(direction) {
         scrubberState.viewDirection = direction;
         // intersection observer must be recreated to change the root margin
-        intersectObserver.disconnect();
+        intersectObserver === null || intersectObserver === void 0 ? void 0 : intersectObserver.disconnect();
         document.body.classList.remove('vertical', 'horizontal', 'horizontal-rtl');
         document.body.classList.add(direction);
         switch (direction) {
@@ -534,7 +700,7 @@ const INTERSECT_MARGIN = {
         visiblePage === null || visiblePage === void 0 ? void 0 : visiblePage.scrollIntoView({ inline: 'center' });
     }
     function handleHorizontalScroll(event) {
-        if (event.ctrlKey || event.shiftKey || event.altKey || event.metaKey) {
+        if (event.ctrlKey || event.shiftKey || event.altKey || event.metaKey || !event.deltaY) {
             return;
         }
         switch (scrubberState.viewDirection) {
@@ -567,10 +733,24 @@ const INTERSECT_MARGIN = {
         document.addEventListener('wheel', handleHorizontalScroll, { passive: false });
     }
     function setupScrubberPreview() {
-        const previewImages = images.map((img) => {
+        const previewImages = images.map((img, i) => {
             const previewImage = document.createElement('img');
-            previewImage.src = img.src;
+            previewImage.loading = 'lazy';
             previewImage.classList.add('scrubber-preview-image');
+            previewImage.dataset.index = `${i}`;
+            if (configIni.dynamicImageLoading) {
+                previewImage.src = loadingPlaceholder;
+            }
+            else {
+                previewImage.src = img.dataset.thumbnail || loadingPlaceholder;
+            }
+            previewImage.dataset.src = `${img.dataset.thumbnail}`;
+            previewImage.addEventListener('error', async (event) => {
+                previewImage.src = loadingPlaceholder;
+                await asyncTimeout(2000);
+                previewImage.src = previewImage.dataset.src || loadingPlaceholder;
+            });
+            previewImage.style.width = `${heightToRatioWidth(img, 180)}px`;
             return previewImage;
         });
         scrubberPreviewDiv.append(...previewImages);
@@ -585,7 +765,12 @@ const INTERSECT_MARGIN = {
         scrubberMarkerActive.style.transform = `translateY(${activeY}px)`;
         scrubberMarkerActive.innerText = `${activeIndex + 1}`;
     }
-    function setupScrubber() {
+    function setupScrubber(configIni) {
+        if (configIni.disableNavBar) {
+            scrubberIconDiv.style.display = 'none';
+            scrubberContainerDiv.style.display = 'none';
+            return;
+        }
         let prevImage;
         const setPreviewScroll = (cursorY) => {
             const cursorYRatio = cursorY / scrubberState.screenHeight;
@@ -598,6 +783,7 @@ const INTERSECT_MARGIN = {
         const setMarkerText = (text) => {
             scrubberMarker.innerText = text;
         };
+        const debouncedUpdateLoadedImages = debounce(updateLoadedImages, 0);
         let scrubberActivated = false;
         scrubberDiv.addEventListener('mouseenter', () => {
             if (!scrubberActivated) {
@@ -614,25 +800,31 @@ const INTERSECT_MARGIN = {
         });
         scrubberDiv.addEventListener('mouseleave', () => {
             scrubberContainerDiv.style.opacity = '0';
+            if (configIni.dynamicImageLoading) {
+                updateLoadedImages(scrubberImages, null, maxLoadedPreviews, 'scrubber');
+            }
         });
         scrubberDiv.addEventListener('mousemove', (event) => {
             var _a;
             const cursorY = event.clientY;
             const cursorYRatio = cursorY / scrubberState.screenHeight;
-            const imageIndex = Math.floor(cursorYRatio * images.length);
-            const image = scrubberImages[imageIndex];
+            scrubberState.previewPageIndex = Math.floor(cursorYRatio * images.length);
+            if (configIni.dynamicImageLoading) {
+                debouncedUpdateLoadedImages(scrubberImages, scrubberState.previewPageIndex, maxLoadedPreviews, 'scrubber');
+            }
+            const image = scrubberImages[scrubberState.previewPageIndex];
             if (!image) {
                 return;
             }
             if (event.buttons & 1) {
                 // Allow left click drag scrubbing
-                if (imageIndex !== scrubberState.visiblePageIndex) {
-                    (_a = images[imageIndex]) === null || _a === void 0 ? void 0 : _a.scrollIntoView({ inline: 'center' });
+                if (scrubberState.previewPageIndex !== scrubberState.visiblePageIndex) {
+                    (_a = images[scrubberState.previewPageIndex]) === null || _a === void 0 ? void 0 : _a.scrollIntoView({ inline: 'center' });
                 }
             }
             animationDispatcher.addTask('mousemove', () => {
                 setMarkerPosition(cursorY);
-                setMarkerText(`${imageIndex + 1}`);
+                setMarkerText(`${scrubberState.previewPageIndex + 1}`);
                 setPreviewScroll(cursorY);
                 if (prevImage !== image) {
                     image.classList.add('hovered');
@@ -669,11 +861,10 @@ const INTERSECT_MARGIN = {
             updateToast.classList.remove('show');
         }
     }
-    function main() {
+    async function main() {
         setupListeners();
         loadSettings();
         checkVersion();
-        setupScrubber();
     }
     main();
 })();
